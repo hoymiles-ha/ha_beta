@@ -76,7 +76,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable
+import time
+from typing import Any, Callable, Final
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
@@ -94,7 +95,9 @@ from .const import (
     ROLE_MASTER_SINGLE,
     ROLE_MULTIPHASE_MASTER,
     T_AVAILABILITY,
+    T_ATTRIBUTES,
     T_EMS_MODE_STATE,
+    T_GROUP_META,
     T_MASTER_AVAILABILITY,
     T_PHASE_AVAILABILITY,
     T_ROLE_AVAILABILITY,
@@ -125,6 +128,22 @@ PatchFn = Callable[[str, dict[str, Any]], bool]
 #
 # Keys are the discovery object name, e.g. ``fan_mode``.
 CapabilityListener = Callable[[frozenset[str]], None]
+
+# How far back from the ``attributes`` message a fresh config may have arrived
+# and still count as part of the same profile.
+#
+# The two are separate MQTT messages with no ordering guarantee, so a config can
+# land first - measured on MSA-280519991122: one ``input_power/config`` at
+# 6.0 s and the ``attributes`` at 6.0 s, i.e. the same 100 ms.  Six seconds
+# covers that race with room to spare.
+#
+# It has to stay **short**: the unit re-announces ``attributes`` every ~14 s and
+# each burst is followed by ~12 s of configs, so a wider window would simply
+# keep counting the previous burst for ever.  The only case that could be hurt
+# is a profile change that does *not* restart the device, where the old burst
+# is seconds away from the new announcement - and a protocol or role switch
+# always reconnects, which is a far longer gap than this.
+CAP_BURST_S: Final = 6.0
 
 # Discovery objects whose firmware entity is replaced by integration entities.
 #
@@ -442,6 +461,18 @@ class FirmwareDiscoveryPatcher:
         # ``SUPERSEDED_DISCOVERY_OBJECTS``.
         self._capabilities: set[str] = set()
         self._capability_listeners: list[CapabilityListener] = []
+        # --- what the Control page may draw (see `card_capabilities`) -------
+        # When each capability was last announced by a **fresh** publication
+        # (MQTT ``retain`` clear), in `time.monotonic()` seconds.  Retained
+        # payloads are never recorded here: the broker still holds every config
+        # the unit published under an earlier profile or protocol, and a retained
+        # message carries no time stamp to tell "still true" from "true before
+        # the reboot".
+        self._live_at: dict[str, float] = {}
+        # When the unit last described itself (`sensor/<dev>/attributes`).
+        self._attrs_at: float | None = None
+        self._capability_epoch = 0
+        self._capability_ready = False
         # The role the device reports (§32 ``role``), set by the coordinator.
         # ``None`` leaves every role dependent choice wide open, which is the safe
         # direction right after a restart.
@@ -463,6 +494,47 @@ class FirmwareDiscoveryPatcher:
         """Discovery objects this device announced (``fan_mode``, ...)."""
         return frozenset(self._capabilities)
 
+    @property
+    def capability_epoch(self) -> int:
+        """How often the card's list may have changed."""
+        return self._capability_epoch
+
+    @property
+    def capability_ready(self) -> bool:
+        """Has the unit described itself yet (``attributes`` received)?"""
+        return self._capability_ready
+
+    @property
+    def card_capabilities(self) -> frozenset[str]:
+        """What the Control page may draw - and nothing else.
+
+        The unit says "this is my current profile" by republishing
+        ``sensor/<dev>/attributes``, and everything the page knew before that
+        described the profile it just left.  So the cut is a **moment in time**:
+        a capability counts only if the unit published it *fresh* (``retain``
+        clear) around or after the last ``attributes`` message.
+
+        Two details make this survive real broker behaviour:
+
+        * **Ordering.**  ``attributes`` and the configs that follow it are
+          separate messages with no ordering guarantee, and could in principle
+          arrive the other way round.  ``CAP_BURST_S`` therefore reaches a few
+          seconds *back* from the ``attributes`` moment, so a config that came
+          first still counts.  It never reaches back far enough to revive an old
+          profile, because a whole profile change is preceded by a reboot.
+        * **Retained payloads never count.**  They are exactly the leftovers -
+          the MQTTS-era ``switch``/``reboot``/``ems_mode`` configs are still on
+          the broker after the unit moved to plain MQTT, where §3-§20 of the
+          protocol say those topics no longer exist at all.
+
+        Before the first ``attributes`` message the union is the answer, so a
+        unit that never describes itself keeps the page it always had.
+        """
+        if self._attrs_at is None:
+            return frozenset(self._capabilities)
+        cutoff = self._attrs_at - CAP_BURST_S
+        return frozenset(name for name, at in self._live_at.items() if at >= cutoff)
+
     @callback
     def async_add_capability_listener(self, listener: CapabilityListener) -> Callable[[], None]:
         """Call ``listener`` with the full set whenever a new object appears.
@@ -482,22 +554,82 @@ class FirmwareDiscoveryPatcher:
         return _remove
 
     @callback
-    def _record_capability(self, path: str) -> None:
+    def _record_capability(self, path: str, retained: bool) -> None:
         """Remember one announced discovery object and notify the listeners.
 
         Deleted (superseded / legacy) objects never reach here, because they are
         handled before the capability bookkeeping.
         """
         parts = path.split("/")
-        if len(parts) < 3:
+        if len(parts) < 2:
             return
         name = parts[-1]
-        if name in self._capabilities:
+        if name == self.dev_id:
+            # A four level topic (``switch/<dev_id>/config``) carries no object
+            # id - the component itself is the feature.
+            name = parts[0]
+        self._note_capability(name, retained)
+
+    @callback
+    def _note_capability(self, name: str, retained: bool) -> None:
+        """Record one capability; only a fresh publication moves the card clock."""
+        if not name:
             return
-        self._capabilities.add(name)
+        changed = False
+        if name not in self._capabilities:
+            # The union drives entity creation and must never shrink: a platform
+            # cannot take an entity back.
+            self._capabilities.add(name)
+            changed = True
+        if not retained:
+            self._live_at[name] = time.monotonic()
+            changed = True
+        if not changed:
+            return
+        self._capability_epoch += 1
         snapshot = frozenset(self._capabilities)
         for listener in list(self._capability_listeners):
             listener(snapshot)
+
+    @callback
+    def _on_attributes_message(self, msg: Any) -> None:
+        """The unit described itself: wipe the Control page and start over.
+
+        Only the *moment* is recorded - the payload is not read.  §1 of the
+        protocol says the map must **not** be used as the capability list
+        ("以设备实际发布和订阅的主题为准"), and in practice it is neither
+        complete nor stable: ``fan``, ``heat`` and the four limit groups never
+        appear in it, ``soc_h_limit`` is missing on units that obviously have
+        cut-offs, and ``entity_desc.switch`` is a label, not a permission.
+
+        Recording the moment is enough because `card_capabilities` compares
+        against it: every card the page drew before this message goes away, and
+        only configs / ``meta`` groups the unit publishes fresh afterwards (or
+        in the same burst, see `CAP_BURST_S`) bring a card back.
+        """
+        self._attrs_at = time.monotonic()
+        self._capability_ready = True
+        self._capability_epoch += 1
+        _LOGGER.debug(
+            "Capabilities of %s reset: the unit described itself", self.dev_id
+        )
+        snapshot = frozenset(self._capabilities)
+        for listener in list(self._capability_listeners):
+            listener(snapshot)
+
+    @callback
+    def _on_group_meta_message(self, msg: Any) -> None:
+        """A ``meta`` group arrived: that group exists on this unit.
+
+        These groups have no discovery config of their own - `number.py` creates
+        the entities from the description - so they would otherwise be missing
+        from the capability list and every card that depends on them would hide.
+        """
+        if not msg.payload:
+            return
+        parts = msg.topic.split("/")
+        if len(parts) >= 4:
+            self._note_capability(parts[-2], bool(getattr(msg, "retain", False)))
 
     async def async_setup(self) -> None:
         """Subscribe to the discovery topics of this device.
@@ -518,6 +650,19 @@ class FirmwareDiscoveryPatcher:
             self._unsubs.append(unsub)
             _LOGGER.debug("Watching firmware discovery topics on %s", topic)
 
+        # The unit's announcement that its profile is (re)established.  This is
+        # the signal that the Control page must forget what it knew - see
+        # `card_capabilities` - and the ``meta`` groups that have no discovery
+        # config of their own, so they need a subscription of their own.
+        extra = (
+            (T_ATTRIBUTES.format(dev_id=self.dev_id), self._on_attributes_message),
+            (T_GROUP_META.format(dev_id=self.dev_id, group="+"), self._on_group_meta_message),
+        )
+        for topic, handler in extra:
+            unsub = await mqtt_util.mqtt.async_subscribe(self.hass, topic, handler, 1)
+            self._unsubs.append(unsub)
+            _LOGGER.debug("Watching capability topics on %s", topic)
+
     @callback
     def async_shutdown(self) -> None:
         """Stop watching discovery topics."""
@@ -531,6 +676,7 @@ class FirmwareDiscoveryPatcher:
         path = _object_path(msg.topic)
         if path is None:
             return
+        retained = bool(getattr(msg, "retain", False))
 
         # An empty payload is how a retained config gets deleted - either by us
         # a moment ago or by somebody else.  Nothing left to do, and skipping
@@ -543,14 +689,14 @@ class FirmwareDiscoveryPatcher:
             # Still recorded: a superseded object (``soc_limit``, ``fan_speed``)
             # proves the device *has* that feature, it just cannot express it
             # through a scalar.  The integration entities are gated on it.
-            self._record_capability(path)
+            self._record_capability(path, retained)
             self.hass.async_create_task(self._async_remove(msg.topic))
             return
 
         # Every config that describes something this device really has is
         # recorded before the payload is parsed - a config we cannot parse is
         # still proof that the feature exists.
-        self._record_capability(path)
+        self._record_capability(path, retained)
 
         patch = self._patches.get(path)
         if patch is None:

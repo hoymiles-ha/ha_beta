@@ -4,17 +4,24 @@
  * Lovelace card bundled with the `hoymiles` custom integration.
  *
  * Protocol V0.6.2 §45: the device itself measures where today's energy went and
- * publishes the nine flows it knows about, every five minutes, on
+ * publishes the flows it knows about, every five minutes, on
  *
  *     sensor/<dev_id>/sankey/state        (Wh, reset at 00:00)
  *
- *     pv_prod    e2l  pv -> load          e2b  pv -> battery
- *                e2g  pv -> grid          b2g  battery -> grid
+ *     pv_prod    e2l  pv -> load (unknown)   e2b  pv -> battery
+ *                e2g  pv -> grid            b2g  battery -> grid
  *                tp2b third party -> battery
  *                tp2g third party -> grid
  *     load_cons  efpv pv -> load (same as e2l)
  *                efb  battery -> load     efg  grid -> load
  *                g2b  grid -> battery
+ *
+ * The house is one sink (**load**).  A later firmware revision added `*kl` and
+ * `*loss` edges that split it into three; they are not drawn, because the
+ * diagram is the documented ten-field one: four sources on the left (PV,
+ * third-party PV, battery out, grid in) and three sinks on the right (load,
+ * battery in, grid out).  Both columns are always drawn, even when a flow is
+ * zero - the picture doubles as the legend of where energy can go.
  *
  * The integration decodes that into the `Energy Flow Today` sensor, and this
  * card draws those numbers.  Nothing is estimated and nothing is read from the
@@ -45,8 +52,12 @@
  * grid flows would all be zero and the picture would claim the unit never
  * imports or exports.  The dashboard layout is built with that in mind.
  *
- * Layout: a direct source -> sink sankey.  Four sources on the left, three
- * sinks on the right, and a ribbon for every flow the device reported.
+ * Layout: a direct source -> sink sankey.  Four sources on the left (PV,
+ * third-party PV, battery out, grid in), three sinks on the right (load,
+ * battery in, grid out), and a ribbon for every flow the device reported.
+ * Battery and grid therefore appear twice, once per direction: the device
+ * measures them as two separate flows and one box cannot be both a source and
+ * a sink of the same diagram.
  *
  * Interaction: click a ribbon to highlight that single flow, or click a node
  * box to highlight every ribbon that touches it.  Pure view state - the
@@ -79,6 +90,9 @@ function _hmSankeyRegister() {
     "Grid in": "Netzbezug",
     "Grid out": "Netzeinspeisung",
     "Load": "Last",
+    "Unknown load": "Unbekannte Last",
+    "Known load": "Bekannte Last",
+    "Loss": "Verlust",
     "total": "gesamt",
     "No data yet.": "Noch keine Daten.",
     "No energy recorded today.": "Heute keine Energie aufgezeichnet.",
@@ -230,14 +244,18 @@ function _hmSankeyRegister() {
         <path d="M12 2.9v2.5M12 18.6v2.5M2.9 12h2.5M18.6 12h2.5"/>
         <path d="M5.5 5.5 7.3 7.3M16.7 16.7l1.8 1.8M18.5 5.5 16.7 7.3M7.3 16.7l-1.8 1.8"/>
       </g>`,
-    /* A second, smaller sun: "another PV source".  No longer used - third-party
-       PV is folded into `pv` - but kept so an old dashboard that still passes
-       `icons.tp` has something to draw. */
-    tp: `<circle cx="10" cy="10" r="3.6" fill="#fff"/>
-      <g stroke="#fff" stroke-width="1.7" stroke-linecap="round">
-        <path d="M10 2v2M2 10h2M4.6 4.6 6 6M15.4 4.6 14 6M4.6 15.4 6 14"/>
+    /* A second, smaller sun with "3rd" in the corner: a PV source that is not
+       this unit's own MPPT (a neighbouring micro inverter on the AC side).
+       The corner badge used to be a plain white dot, which read as decoration;
+       three letters say which sun is the extra one without a legend.  The sun
+       is pulled into the top-left third so the letters can carry a font size
+       that survives the plate being drawn ~13 px tall on a laptop. */
+    tp: `<circle cx="8.4" cy="8.2" r="3.1" fill="#fff"/>
+      <g stroke="#fff" stroke-width="1.6" stroke-linecap="round">
+        <path d="M8.4 1.4v1.7M1.4 8.2h1.7M3.3 3.1 4.5 4.3M13.5 3.1 12.3 4.3M3.3 13.1 4.5 11.9"/>
       </g>
-      <circle cx="17.4" cy="17.4" r="3" fill="#fff"/>`,
+      <text x="22.8" y="21.3" text-anchor="end" font-size="9.6"
+        font-weight="700" fill="#fff" letter-spacing="-0.3">3rd</text>`,
     /* Battery with a bolt: energy is leaving the pack. */
     bat_out: `<rect x="2.6" y="6.4" width="14.6" height="11.2" rx="2.6"
         fill="none" stroke="#fff" stroke-width="1.9"/>
@@ -275,37 +293,47 @@ function _hmSankeyRegister() {
   /* Colors follow the reference the user supplied: PV is yellow, battery is
      green (two shades, so charge and discharge stay apart), the grid is grey
      (it is a metered utility, not a colour of its own) and the load is blue.
-     The node text is dark (#111), which stays legible on all four. */
+     The node text is dark (#111), which stays legible on all four.
+     Third-party PV is a deeper amber next to the yellow, so the two suns stay
+     distinguishable without turning the picture into a colour chart. */
   const SOURCES = [
     { id: "pv", side: "src", en: "PV", zh: "光伏供电", color: "#F5C342" },
+    /* Third-party PV sits directly under the unit's own PV: the two are the same
+       kind of source and reading them next to each other is how the picture is
+       read.  The order of this array is the order of the column. */
+    { id: "tp", side: "src", en: "Third-party PV", zh: "第三方光伏", color: "#E0A23C" },
     { id: "bat_out", side: "src", en: "Battery out", zh: "电池供电", color: "#45C08C" },
     { id: "grid_in", side: "src", en: "Grid in", zh: "电网供电", color: "#A9AEB3" },
   ];
 
   const SINKS = [
-    { id: "load", side: "snk", en: "Load", zh: "负载消耗", color: "#2E90D6" },
+    { id: "load", side: "snk", en: "Load", zh: "负载", color: "#2E90D6" },
     { id: "bat_in", side: "snk", en: "Battery in", zh: "存入电池", color: "#22C55E" },
     { id: "grid_out", side: "snk", en: "Grid out", zh: "馈入电网", color: "#8F959B" },
   ];
 
   /* ------------------------------------------------------------------ *
-   * The nine flows the device reports, and the sensor attribute each one
-   * arrives in.  `e2l` and `efpv` are the same quantity seen from the two
-   * sides of the topic; the production side (`e2l`) is used, so no flow is
-   * counted twice.
+   * The nine flows the documented document carries, and the sensor attribute
+   * each one arrives in.  `e2l` and `efpv` are the same quantity seen from the
+   * two sides of the topic; the production side (`e2l`) is used, so no flow is
+   * counted twice - `efpv` is deliberately absent below.
+   *
+   * The id is `<group>_<field>`: `_readingsFromPayload` splits it back into the
+   * wire group and field.  `tp2b` / `tp2g` keep the `pv_` prefix because they
+   * live in `pv_prod`, even though they leave the **third-party** node.
    * ------------------------------------------------------------------ */
   const FLOWS = [
+    /* PV side. */
     { id: "pv_e2l", from: "pv", to: "load" },
     { id: "pv_e2b", from: "pv", to: "bat_in" },
     { id: "pv_e2g", from: "pv", to: "grid_out" },
-    /* Third-party PV is a second PV input on the same unit, not a different
-       kind of energy, so the card folds it into the single `pv` node: the
-       reference picture has one yellow source on the left.  Its two flows keep
-       their own ids (they are separate measurements) and are ADDED to the same
-       pv -> bat_in / pv -> grid_out entries - see the accumulation in
-       _buildGraph. */
-    { id: "pv_tp2b", from: "pv", to: "bat_in" },
-    { id: "pv_tp2g", from: "pv", to: "grid_out" },
+    /* Third-party PV is its own source: folding it into `pv` hid the fact that
+       the unit's own MPPT produced nothing while a neighbouring inverter did. */
+    { id: "pv_tp2b", from: "tp", to: "bat_in" },
+    { id: "pv_tp2g", from: "tp", to: "grid_out" },
+    /* Battery out (discharge) and grid in.  These two are read from the load
+       group: the device publishes them as "what fed the house", not as part of
+       the PV side. */
     { id: "pv_b2g", from: "bat_out", to: "grid_out" },
     { id: "load_efb", from: "bat_out", to: "load" },
     { id: "load_efg", from: "grid_in", to: "load" },
@@ -486,6 +514,11 @@ function _hmSankeyRegister() {
     if (!n) return { scale: 0, minH: MIN_NODE_H };
     const usable = Math.max(8, avail - (n - 1) * GAP);
     const minH = Math.min(MIN_NODE_H, usable / n);
+    /* Every node at zero: the diagram is a legend of where energy can go, so
+       the boxes are stretched to fill the column evenly instead of huddling at
+       the top.  The doubling loop below would otherwise run its full 80 rounds
+       against a zero sum. */
+    if (!values.some((v) => v > 0)) return { scale: 0, minH: usable / n };
     const sum = (s) => values.reduce((acc, v) => acc + Math.max(minH, v * s), 0);
     let lo = 0;
     let hi = Math.max(1e-6, usable / Math.max(1e-9, Math.min(...values)));
@@ -1372,9 +1405,9 @@ function _hmSankeyRegister() {
       let total = 0;
       for (const flow of FLOWS) {
         const value = num(readings[flow.id]);
-        /* Accumulate, do not assign: two measurements can now feed the same
-           pair of nodes (pv_e2b + pv_tp2b both become pv -> bat_in).  Plain
-           assignment would keep only the last one and quietly drop energy. */
+        /* Accumulate, do not assign: the device reports both ends of a flow and
+           a future revision may split one edge in two.  Plain assignment would
+           keep only the last measurement of a pair and quietly drop energy. */
         const key = `${flow.from}|${flow.to}`;
         table[key] = (table[key] || 0) + value;
         srcValue[flow.from] = (srcValue[flow.from] || 0) + value;
@@ -1382,14 +1415,15 @@ function _hmSankeyRegister() {
         total += value;
       }
 
-      const srcs = SOURCES
-        .map((d) => ({ ...d, value: srcValue[d.id] || 0 }))
-        .filter((d) => d.value > EPS);
-      const snks = SINKS
-        .map((d) => ({ ...d, value: snkValue[d.id] || 0 }))
-        .filter((d) => d.value > EPS);
+      /* Every node is drawn, even at 0 Wh.  The picture is also a legend of
+         where energy *can* go, and a column that disappeared the moment the
+         battery went idle (or the sun set) read as a broken diagram rather
+         than as a quiet one.  A zero node keeps the minimum height and simply
+         carries no ribbon - the loop below skips values at or below EPS. */
+      const srcs = SOURCES.map((d) => ({ ...d, value: srcValue[d.id] || 0 }));
+      const snks = SINKS.map((d) => ({ ...d, value: snkValue[d.id] || 0 }));
 
-      if (total <= EPS || !srcs.length || !snks.length) {
+      if (!srcs.length || !snks.length) {
         return { empty: true, total: 0 };
       }
 

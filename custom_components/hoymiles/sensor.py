@@ -123,14 +123,16 @@ def s(field: str, default: Any = None) -> Callable[[dict], Any]:
 
 
 # ``system/state`` counts only the unit's own PV ports.  Protocol §45 reports
-# the third-party PV energy as two separate flows - into the battery (``tp2b``)
+# the third-party PV energy as flows of its own - into the battery (``tp2b``)
 # and out to the grid (``tp2g``).  There is no ``tp2l``, so the third-party
-# energy that reached the load is not in those two numbers; ``system/state``
+# energy that reached the load is not in those numbers; ``system/state``
 # carries that port's own production as ``pv2_e`` instead.
 #
 # Hence the rule the dashboard shows (spec from the vendor app):
 #
-#     total      = e2b + e2g + e2l + MAX(tp2g + tp2b, PV2)
+#     own        = e2b + e2g + e2l
+#     third      = tp2b + tp2g
+#     total      = own + MAX(third, PV2)
 #     grid_rate  = (b2g + e2g + tp2g) / total
 #     grid_rate >  1 : self_rate = (e2b + tp2b + e2l + pv2_to_load) / total
 #     grid_rate <= 1 : self_rate = 1 - grid_rate
@@ -147,27 +149,50 @@ def s(field: str, default: Any = None) -> Callable[[dict], Any]:
 # unit with no third-party input has both at 0 and the total is just its own
 # production, so the same formula serves both hardware variants.
 THIRD_PARTY_PV_FLOWS: Final = ("tp2b", "tp2g")
-PV_OWN_FLOWS: Final = ("e2b", "e2g", "e2l")
+# The PV side's own edges, as the documented document carries them.  A later
+# firmware revision added two more edges per side (``e2kl`` / ``e2loss`` and
+# their third-party twins) that split the house into three sinks; the diagrams
+# draw one load node, so those are ignored on purpose - see ``const.py``.
+PV_OWN_FLOWS: Final = ("e2l", "e2b", "e2g")
 
 
-def _pv_flow_group(data: dict[str, Any]) -> dict[str, Any]:
-    group = _payload(data, SRC_SANKEY).get("pv_prod")
-    return group if isinstance(group, dict) else {}
+def _sankey_groups(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The two ``sankey/state`` groups, a missing one as an empty dict."""
+    raw = _payload(data, SRC_SANKEY)
+    groups: dict[str, dict[str, Any]] = {}
+    for group in ("pv_prod", "load_cons"):
+        value = raw.get(group)
+        groups[group] = value if isinstance(value, dict) else {}
+    return groups
 
 
-def _flow_sum(group: dict[str, Any], fields: tuple[str, ...]) -> float:
+def _flows_sum(
+    flows: dict[str, dict[str, Any]], fields: tuple[str, ...]
+) -> float:
+    """Sum flow fields whichever group they were published in.
+
+    ``e2b`` lives in ``pv_prod`` and ``e2kl`` in ``load_cons``; a caller asking
+    for "the PV side's total" must not have to know which.  A field absent from
+    one group contributes that group's 0, so firmware that only publishes the
+    old ten fields still adds up.
+    """
     total = 0.0
     for field in fields:
-        try:
-            total += float(group.get(field) or 0)
-        except (TypeError, ValueError):
-            continue
+        for group in ("pv_prod", "load_cons"):
+            try:
+                total += float((flows.get(group) or {}).get(field) or 0)
+            except (TypeError, ValueError):
+                continue
     return total
 
 
 def _third_party_pv_today(data: dict[str, Any]) -> float:
-    """Today's third-party PV energy as measured by its flows (tp2b + tp2g)."""
-    return _flow_sum(_pv_flow_group(data), THIRD_PARTY_PV_FLOWS)
+    """Today's third-party PV energy as measured by its flows.
+
+    ``tp2b`` + ``tp2g`` plus the two edges that reach the separated sinks
+    (``tp2kl`` / ``tp2loss``).
+    """
+    return _flows_sum(_sankey_groups(data), THIRD_PARTY_PV_FLOWS)
 
 
 def _pv2_today(data: dict[str, Any]) -> float:
@@ -187,14 +212,14 @@ def pv_totals(data: dict[str, Any], field: str = "pv_e") -> dict[str, Any] | Non
     """Today's PV production split the way the vendor app counts it.
 
     ``pv_own`` is the unit's own ports.  It comes from the measured flows
-    (``e2b + e2g + e2l``) when §45 has arrived and from ``pv_e`` otherwise -
+    (:data:`PV_OWN_FLOWS`) when §45 has arrived and from ``pv_e`` otherwise -
     both are the same quantity, and the fallback keeps the tile alive in the
     minutes between a restart and the first history document.  ``pv_extra`` is
     ``MAX(third-party flows, PV2)``; ``pv_total`` is the sum.
     """
     system_pv = _payload(data, SRC_SYSTEM).get(field)
-    group = _pv_flow_group(data)
-    measured = _flow_sum(group, PV_OWN_FLOWS)
+    groups = _sankey_groups(data)
+    measured = _flows_sum(groups, PV_OWN_FLOWS)
     if measured > 0:
         own = measured
     elif system_pv is not None:
@@ -208,7 +233,7 @@ def pv_totals(data: dict[str, Any], field: str = "pv_e") -> dict[str, Any] | Non
     else:
         return None
 
-    third = _flow_sum(group, THIRD_PARTY_PV_FLOWS)
+    third = _flows_sum(groups, THIRD_PARTY_PV_FLOWS)
     pv2 = _pv2_today(data)
     extra = max(third, pv2)
     return {
@@ -273,8 +298,8 @@ def self_consumption(
     vendor rule has no measurement to divide by.
     """
     pv = flows.get("pv_prod") or {}
-    own = _flow_sum(pv, PV_OWN_FLOWS)
-    third = _flow_sum(pv, THIRD_PARTY_PV_FLOWS)
+    own = _flows_sum(flows, PV_OWN_FLOWS)
+    third = _flows_sum(flows, THIRD_PARTY_PV_FLOWS)
     total = own + max(third, pv2)
     if total <= 0:
         return None
@@ -1433,7 +1458,13 @@ class HoymilesEnergyFlowSensor(
 
     @property
     def native_value(self) -> int | None:
-        """Today's total consumption in Wh."""
+        """Today's total consumption in Wh.
+
+        The three ``load_cons`` edges are the whole house in the documented
+        document: PV to load (``efpv``), battery to load (``efb``) and grid to
+        load (``efg``).  Energy that went into the battery is not counted here -
+        it is not consumed until it comes back out.
+        """
         if not isinstance(self.coordinator.data.get(SRC_SANKEY), dict):
             return None
         load = self._flows["load_cons"]

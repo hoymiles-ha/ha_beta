@@ -157,6 +157,21 @@ function _hmControlRegister() {
     "s": "s",
     "Send all": "Alle senden",
     "Takes about a minute": "Dauert etwa eine Minute",
+    "Open the off-grid relay?": "Off-Grid-Relais \u00f6ffnen?",
+    ["Once opened, the relay stays locked for a while before it accepts "
+      + "`close` again: about 10 minutes the first time, and 10 minutes "
+      + "longer each further time (20, 30\u2026). The off-grid port has no "
+      + "output during that wait."]:
+      "Nach dem \u00d6ffnen bleibt das Relais eine Weile gesperrt, bevor es "
+      + "`close` wieder annimmt: beim ersten Mal etwa 10 Minuten, und jedes "
+      + "weitere Mal 10 Minuten l\u00e4nger (20, 30\u2026). Der Inselausgang "
+      + "hat in dieser Zeit keine Ausgabe.",
+    "Got it": "Verstanden",
+    "Cancelled - the relay stays closed.": "Abgebrochen - das Relais bleibt geschlossen.",
+    ["The relay is now locked - it will accept close again in about "
+      + "10 minutes at the earliest."]:
+      "Das Relais ist jetzt gesperrt und nimmt fr\u00fchestens in etwa "
+      + "10 Minuten wieder `close` an.",
   };
 
   /** Map any Home Assistant language tag to one of the three card languages. */
@@ -272,11 +287,29 @@ function _hmControlRegister() {
     { id: "meter_ctrl", en: "Meter ctrl", zh: "虚拟电表" },
   ];
 
-  /* What a **slave** may select (§7/§8 with the system level modes belonging to
-     the master): its own regulation, and the device level precise control block
-     whose topics §13/§14 mark as 角色: 不限.  `mqtt_ctrl`, `tou_plan` and
-     `meter_ctrl` write system level setpoints, so a slave is never offered them. */
-  const EMS_MODES_SLAVE = ["general", "fine_ctrl"];
+  /* Which EMS modes each role gets.  The protocol lists a fixed five and adds a
+     supporting note per option; the **product rule** on top of that is:
+
+       general     every role
+       mqtt_ctrl   master, single      (§9/§10 是 主机和单机)
+       fine_ctrl   **single only**     (§13/§14 精准控制只在单机开放)
+       tou_plan    master, single      (§15-§20 是 主机和单机)
+       meter_ctrl  master, single      (§11/§12 是 主机和单机)
+
+     `fine_ctrl` is the exception to §13/§14's 角色: 不限: precise control is a
+     single-unit feature, so it is not offered on a master (the system level
+     modes own the setpoints there) nor on a slave.
+
+     The discovered option list is **not** narrowed - it keeps the protocol's
+     five, so a unit that changes role regains its modes without the firmware
+     republishing.  An unreported role ("" before the retained event lands)
+     keeps everything, so a page load never blanks the picker. */
+  const EMS_MODES_BY_ROLE = {
+    master: ["general", "mqtt_ctrl", "tou_plan", "meter_ctrl"],
+    single: EMS_MODES.map((mode) => mode.id),
+    slave: ["general"],
+  };
+
   const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
   /* Protocol V0.6.2 §35: how the two fans are driven. `disable` stops them, and
@@ -341,8 +374,9 @@ function _hmControlRegister() {
 
   /* §29/§30: the feed-in ceiling.  Unlike `input_power` the 0 end is meaningful
      - 0 forbids exporting to the grid.  V0.6.7 turned the topic into a group
-     (an `enable` switch + this limit behind one object) that only a **master**
-     publishes, so `_allowMasterOnly()` still decides whether the group is drawn. */
+     (an `enable` switch + this limit behind one object) that a master **and** a
+     stand-alone unit publish (角色: 主机和单机), so `_allowMaster()` decides
+     whether the group is drawn. */
   const FEED_POWER = { lo: 0, hi: 2500 };
 
   /* V0.6.7 §29/§30 and §31/§32: the two groups that gained an `enable` switch.
@@ -593,6 +627,39 @@ function _hmControlRegister() {
   const REBOOT_TIMEOUT_MS = 60000;  // the whole wait, start to finish
   const REBOOT_GRACE_MS = 6000;     // pushes still in flight are not "it is back"
   const REBOOT_POLL_MS = 3000;      // how often the backend is asked
+
+  /* How often the backend is asked which cards this unit may show.  The answer
+     only changes when the unit re-describes itself, which happens on every
+     connect and on every reboot, so a couple of seconds is plenty - and short
+     enough that the page is already correct by the time the user looks at it. */
+  const CAPS_POLL_MS = 2500;
+
+  /* What "the device is offline" is decided from.
+
+     **Any one** of these reporting is proof enough that the unit is talking:
+     `quick/state` (1 s) feeds soc / pv_power / battery_status / the system_*
+     numbers, `device/state` (5 min) feeds rssi / battery_temperature and
+     `system/state` (5 min) the rest.  The old rule asked the *first existing*
+     entity and believed it, so one `unknown` entity - a role gated sensor on a
+     slave, or a stale duplicate discovery payload an older firmware left on the
+     same SN - made a perfectly healthy unit look offline and locked the whole
+     page.  Silence has to be collective, not a single entity's opinion.
+
+     `OFFLINE_AFTER_MS` is the tolerance for the slowest cadence: a unit whose
+     entities are all `unavailable` but whose last report is younger than this is
+     still considered alive, because Home Assistant flips the availability topic
+     a moment before the readings stop. */
+  const LIVE_PROBES = [
+    ["soc", "sensor"],
+    ["pv_power", "sensor"],
+    ["battery_status", "sensor"],
+    ["battery_temperature", "sensor"],
+    ["rssi", "sensor"],
+    ["system_pv_power", "sensor"],
+    ["system_soc", "sensor"],
+    ["grid_on_power", "sensor"],
+  ];
+  const OFFLINE_AFTER_MS = 150000;  // 2.5 x the 5 minute topics' cadence margin
 
   /* The entities the firmware pushes every second.  The newest `last_updated`
      among them is the card's heartbeat while it waits for a reboot; `[key,
@@ -1239,6 +1306,16 @@ function _hmControlRegister() {
       this._vmInfo = null;
       this._vmLoading = false;
       this._vmAt = 0;
+      /* What the device says it can control **now**, as `{epoch, keys}` - or
+         `null` while the backend has no answer (an older backend, or a unit that
+         has never published its attributes topic).  `null` means "draw
+         everything", which is exactly the behaviour before this feature.
+         Re-read on a timer; the backend wipes the list every time the unit
+         re-describes itself. */
+      this._caps = null;
+      this._capsAt = 0;
+      this._capsBusy = false;
+      this._capsSig = "";
       /* Last EMS mode this card rendered. Drives the "left / re-entered MQTT
          control" reset - see `_watchEmsMode`. */
       this._lastEmsMode = undefined;
@@ -1453,6 +1530,9 @@ function _hmControlRegister() {
         .meter-rx .rx-count { font-weight: 600; color: var(--primary-text-color);
                               font-variant-numeric: tabular-nums; }
         .meter-rx.live .rx-count { color: var(--primary-color); }
+        /* Nothing pushed yet: the same line, dimmed, so the strip does not
+           shout while it waits. */
+        .meter-rx.wait .rx-count { color: var(--secondary-text-color); font-weight: 500; }
         .meter-rx .rx-latest { font-variant-numeric: tabular-nums; }
         .meter-rx .rx-state { margin-left: auto; white-space: nowrap; }
         /* The unit is a label, not a field: it keeps its own width so the row
@@ -2140,37 +2220,43 @@ function _hmControlRegister() {
            than a card whose height changes with the window. */
 
         /* ------------------------------------------------------------------ *
-         * EMS mode picker: five labels, and one of them is long
+         * EMS mode picker: N labels, one long
          *
-         * Five equal buttons in a 300 px card leave about 50 px each, which
-         * truncates every label to two characters - the user cannot tell which
-         * mode is which. So this ONE picker wraps into 3 + 2 instead.
+         * The number of buttons depends on the role (1 / 4 / 5), so the grid is
+         * keyed on the count the picker actually rendered (its data-n attribute).
+         * Hard-coding the five-button layout left an empty track on a master's
+         * four - a row that visibly ends early - because "one row of five, one
+         * track each" was written as a fixed five-column template.
          *
-         * A plain flex-wrap would leave the second line ragged (two buttons at
-         * a third of the width, half the row empty). A six-track grid fixes
-         * that without any width maths: the first three buttons take two tracks
-         * each (three per line) and the last two take three each, so the second
-         * line fills the row exactly. Source order is preserved, so the picker
-         * still reads in protocol order.
-         *
-         * Wrapping is NOT a window-width accident here: the card itself grows
-         * when the selected mode adds controls (the .wide class spans two
-         * tracks), and a card with room puts the five back on one line. That is
-         * a container query, so it follows the card and not the monitor.
+         * 4 buttons: one row of four when the card has room, 2 + 2 when it does
+         * not (four across a 300 px card truncates every Chinese label).
+         * 5 buttons: 3 + 2 when narrow (three equal tracks per line, no ragged
+         * second row), one row of five once the card is wide enough.  Wrapping is
+         * a container query, so it follows the CARD (which grows with the mode)
+         * and not the monitor.
          * ------------------------------------------------------------------ */
-        .seg.fluid.ems5 { display: grid; flex-wrap: nowrap;
-                          grid-template-columns: repeat(6, minmax(0, 1fr)); }
-        .seg.fluid.ems5 button { min-width: 0; padding: 5px 4px; font-size: 12.5px; }
-        .seg.fluid.ems5 button:nth-child(-n+3) { grid-column: span 2; }
-        .seg.fluid.ems5 button:nth-child(n+4) { grid-column: span 3; }
-        /* Width of the CARD's content box. Below this the five cannot be shown
-           in full; above it one line fits and the extra row would be waste.
-           :nth-child(n) is there for specificity only - it matches every
-           button, exactly like the span rules above, so this later rule wins
-           without an !important. */
+        .seg.fluid.ems { display: grid; flex-wrap: nowrap; }
+        .seg.fluid.ems button { min-width: 0; padding: 5px 4px; font-size: 12.5px; }
+
+        .seg.fluid.ems[data-n="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        @container (max-width: 470px) {
+          .seg.fluid.ems[data-n="4"] {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+          }
+        }
+
+        .seg.fluid.ems[data-n="5"] { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+        .seg.fluid.ems[data-n="5"] button:nth-child(-n+3) { grid-column: span 2; }
+        .seg.fluid.ems[data-n="5"] button:nth-child(n+4) { grid-column: span 3; }
+        /* Width of the CARD's content box: above this the five fit on one line.
+           :nth-child(n) is there for specificity only - it matches every button,
+           exactly like the span rules above, so this later rule wins without an
+           !important. */
         @container (min-width: 520px) {
-          .seg.fluid.ems5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-          .seg.fluid.ems5 button:nth-child(n) { grid-column: span 1; }
+          .seg.fluid.ems[data-n="5"] {
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+          }
+          .seg.fluid.ems[data-n="5"] button:nth-child(n) { grid-column: span 1; }
         }
 
         /* ================================================================== *
@@ -2292,6 +2378,9 @@ function _hmControlRegister() {
       }
       this._reconcileSwitch();
       this._reconcileEmsMode();
+      /* Which optional cards this unit may show. Throttled inside, so this is
+         not one WebSocket round trip per state push. */
+      this._syncCaps();
       this.requestUpdate();
     }
 
@@ -2438,7 +2527,21 @@ function _hmControlRegister() {
 
       const cacheKey = `${domain}:${key}`;
       const cached = this._cache.get(cacheKey);
-      if (cached && hass.states[cached]) return cached;
+      if (cached && hass.states[cached]) {
+        /* A cached answer that landed on **another** prefix must not stick.
+           Two units can share one numeric SN under different prefixes (a live
+           `LAS-…` beside a stale `MSA-…` discovery payload), and this card may
+           well render in the second or two before the live payload arrives -
+           at which point the serial wide fallback below picks the neighbour and
+           the cache would keep it for ever.  Re-resolve as soon as an entity
+           under this device's own slug exists. */
+        const own = `${domain}.${slug(this._dev())}`;
+        if (cached.startsWith(own)
+          || !Object.keys(hass.states).some((id) => id.startsWith(own))) {
+          return cached;
+        }
+        this._cache.delete(cacheKey);
+      }
 
       let found = null;
       const wantUid = new Set([
@@ -2469,9 +2572,22 @@ function _hmControlRegister() {
       // reports on `event/state`.
       if (!found) {
         const serial = serialOf(this._dev());
-        const candidates = Object.keys(hass.states).filter(
+        const all = Object.keys(hass.states).filter(
           (entityId) => entityId.startsWith(`${domain}.`) && entityId.includes(serial)
         );
+        /* Two units can carry the same numeric SN under different prefixes: the
+           live firmware publishes `LAS-280024180016`, while a broker still holds
+           the retained discovery of an older `MSA-280024180016` session.  HA's
+           MQTT device identifiers use the bare SN, so both sets of entities land
+           on ONE device and both ids contain the serial - matching on the serial
+           alone then picked the neighbour's entity.  That is how a **master**
+           card (5 EMS modes) ended up reading the stale **slave** select and
+           offering only `general` / `fine_ctrl`.
+           Entities that start with this device's own slug are authoritative; the
+           serial-wide list is only the fallback for a renamed device. */
+        const own = `${domain}.${slug(this._dev())}`;
+        const sameDevice = all.filter((entityId) => entityId.startsWith(own));
+        const candidates = sameDevice.length ? sameDevice : all;
         for (const alias of ENTITY_ALIASES[key] || [key]) {
           const want = norm(alias);
           const hit = candidates.find((entityId) => {
@@ -2565,31 +2681,40 @@ function _hmControlRegister() {
     /**
      * Is the device itself offline?
      *
-     * Same rule as the power-flow card: the integration marks the fast topics'
-     * entities `unavailable` once nothing has arrived for a minute, and a freshly
-     * started Home Assistant shows `unknown` until the first payload lands.
-     * The first entity that exists decides - a *missing* entity (older firmware)
-     * is not an offline device.
+     * **Any single live reading wins.**  A unit that pushes `quick/state` every
+     * second, or `device/state` / `system/state` every five minutes, is online -
+     * no matter what the other entities say.  Only when *none* of `LIVE_PROBES`
+     * carries a reading and none of them reported within `OFFLINE_AFTER_MS` is
+     * the unit called offline, and a unit with no such entity at all (older
+     * firmware, a hidden entity) is never accused.
      *
-     * This matters for more than cosmetics: nothing stops an MQTT publish to a
-     * powered-off unit, so without this check the card happily "sends" a fan
+     * The old rule asked the first existing entity and believed it, so a stale
+     * duplicate discovery on the same SN (an old `MSA-…` payload beside the live
+     * `LAS-…` one) left `sensor.<dev>_soc` at `unknown` and the control page sat
+     * behind "device offline" while rssi and every other reading kept updating.
+     *
+     * This still matters for more than cosmetics: nothing stops an MQTT publish
+     * to a powered-off unit, so without this check the card happily "sends" a
      * setting into the void and reports success.
      */
     _deviceOffline() {
       if (!this._hass) return false;
-      for (const [key, domain] of [
-        ["soc", "sensor"],
-        ["system_pv_power", "sensor"],
-        ["pv_power", "sensor"],
-        ["battery_status", "sensor"],
-      ]) {
+      const now = Date.now();
+      let seen = 0;
+      for (const [key, domain] of LIVE_PROBES) {
         const entityId = this._resolve(key, domain);
         if (!entityId) continue;
         const state = (this._hass.states || {})[entityId];
         if (!state) continue;
-        return state.state === "unavailable" || state.state === "unknown";
+        seen += 1;
+        const value = String(state.state);
+        if (value !== "" && value !== "unknown" && value !== "unavailable") {
+          return false;
+        }
+        const stamp = Date.parse(state.last_reported || state.last_updated || "");
+        if (Number.isFinite(stamp) && now - stamp <= OFFLINE_AFTER_MS) return false;
       }
-      return false;
+      return seen > 0;
     }
 
     /* ---------------------------- device model --------------------------- */
@@ -2679,21 +2804,9 @@ function _hmControlRegister() {
       return this._role() === "slave";
     }
 
-    /** May this unit use the 角色: 主机和单机 topics (§9-§12, §15-§22, §25, §26, §45)? */
+    /** May this unit use the 角色: 主机和单机 topics (§9-§12, §15-§22, §25, §26, §29, §30, §45)? */
     _allowMaster() {
       return !this._isSlave();
-    }
-
-    /**
-     * May it use a 角色: 仅主机 topic (§29/§30)?
-     *
-     * Stricter than `_allowMaster()`: a **single** unit is excluded too.  An
-     * unreported role stays allowed, like everywhere else on this card, so the
-     * row does not flicker while the state event is still on its way.
-     */
-    _allowMasterOnly() {
-      const role = this._role();
-      return role === "" || role === "master";
     }
 
     /**
@@ -3480,16 +3593,13 @@ function _hmControlRegister() {
       if (!Array.isArray(options) || !options.length) {
         options = EMS_MODES.map((m) => m.id);
       }
-      /* A **slave** only runs its own regulation (`general`) or the device level
-         precise control block (`fine_ctrl`, §13/§14 are 角色: 不限).  The three
-         system level modes write setpoints that belong to the master, so they
-         are not offered here even if the discovered config still lists them
-         (the integration narrows that list too, but a cached payload from before
-         the role was known must not leak through). */
-      if (this._isSlave()) {
-        return options.filter((id) => EMS_MODES_SLAVE.includes(id));
-      }
-      return options;
+      /* V0.6.7 §7: the role decides which of the discovered options are offered.
+         The retained payload keeps the protocol's full five (so a promoted unit
+         gets its modes back without the firmware republishing), and the picker
+         narrows on top of it. */
+      const allowed = EMS_MODES_BY_ROLE[this._role()];
+      if (!allowed) return options;
+      return options.filter((id) => allowed.includes(id));
     }
 
     _sendPowerCtrl() {
@@ -4574,6 +4684,16 @@ function _hmControlRegister() {
               "当前设备已离线，待设备恢复在线后可继续下发控制。",
             )}</span>
           </div>` : ""}
+          ${this._capsBlank() ? html`<div class="offline-note">
+            <span class="oi">${this._icon("faders", 16)}</span>
+            <span>${this._t(
+              "The device announced a new profile, so the previous controls "
+              + "were cleared. Waiting for it to publish the controls it "
+              + "supports now.",
+              "设备已重新上报基本属性，旧的控制项已清空，"
+              + "正在等待它发布当前支持的控制项。",
+            )}</span>
+          </div>` : ""}
           <div class="board">
             ${this._powerCard()}
             ${this._socCard()}
@@ -4679,11 +4799,18 @@ function _hmControlRegister() {
 
     /** Power on/off and the reboot command: both take the unit up or down. */
     _powerCard() {
+      /* Two independent topics, so two independent rows: §3-§6 are both
+         "仅MQTTS", and a unit in plain MQTT answers neither. When the unit
+         republished nothing, no card - that is the whole point of the wipe. */
+      const rows = [];
+      if (this._capsOk("switch")) rows.push(this._switchRow());
+      if (this._capsOk("reboot")) rows.push(this._rebootRow());
+      if (!rows.length) return "";
       return this._card({
         icon: this._icon("bolt"),
         title: this._t("Power", "电源"),
         cls: "power",
-        rows: [this._switchRow(), this._rebootRow()],
+        rows,
       });
     }
 
@@ -4705,15 +4832,28 @@ function _hmControlRegister() {
      * the heater has a card of its own.
      */
     _modeCard(mode) {
-      /* A **slave** keeps this card - it can run its own regulation or the
-         device level precise control - but only those two modes are offered
-         (§7/§8 with the system level modes belonging to the master).
-         `_emsOptions()` is what narrows the picker, so this method never has to
-         branch on the role: the fewer buttons are the whole difference, and the
-         card width follows them (see `wide` below). */
+      /* §7-§8: ``select/<dev>/ems_mode`` is 仅MQTTS, so a unit running plain
+         MQTT has no mode picker at all. */
+      if (!this._capsOk("ems_mode")) return "";
       const rows = [this._emsRow()];
 
-      if (mode === "mqtt_ctrl") {
+      /* The picker only offers the modes §7 allows for this role, so the three
+         system level ones cannot normally be selected on a slave.  A unit can
+         still *report* one (the firmware accepts `mqtt_ctrl` and reverts about
+         15 s later when no setpoint renews the lease), and then drawing dead
+         sliders over topics that do not exist would read like a broken card -
+         the mode explains itself instead. */
+      const masterOnly = !this._allowMaster()
+        && (mode === "mqtt_ctrl" || mode === "tou_plan" || mode === "meter_ctrl");
+
+      if (masterOnly) {
+        rows.push(html`<div class="sep"></div>`);
+        rows.push(html`<div class="note">${this._t(
+          "This is a system level mode, set on the master: this unit is running "
+          + "as a slave, so it has no controls of its own for it.",
+          "该模式属于系统级控制，请在主机上设置：本机为从机，没有对应的控制项。",
+        )}</div>`);
+      } else if (mode === "mqtt_ctrl") {
         if (this._config.show_power_ctrl !== false) {
           rows.push(html`<div class="sep"></div>`);
           rows.push(this._powerCtrlRow());
@@ -4802,6 +4942,81 @@ function _hmControlRegister() {
       });
     }
 
+    /**
+     * May this card be drawn?
+     *
+     * `names` are capability names as the device reports them (the discovery
+     * object name, or the ``meta`` group name).  **Any** one of them is enough:
+     * the cut-off card, for instance, is useful with either limit alone.
+     *
+     * `this._caps === null` means "the backend has not said" - an older backend,
+     * or a unit that has never published its ``attributes`` topic - and answers
+     * `yes` on purpose, so a page never goes blank because a message is missing.
+     *
+     * This is deliberately a **card** level test and nothing finer.  Gating
+     * single rows inside a card was tried and reverted: §32 groups several
+     * fields into one object, and hiding one row of a group reads as "the group
+     * is broken", not as "this unit has no such field".
+     */
+    _capsOk(...names) {
+      if (!this._caps) return true;
+      return names.some((name) => this._caps.keys.has(name));
+    }
+
+    /**
+     * Ask the backend which cards this unit may show.
+     *
+     * The backend builds the answer from what the unit published **fresh** after
+     * its last ``attributes`` message - the retained leftovers of an earlier
+     * protocol or role are deliberately excluded, which is the whole point: a
+     * unit switched from MQTTS to MQTT still has the old ``switch``,
+     * ``reboot`` and ``ems_mode`` configs on the broker although §3-§20 of the
+     * protocol say those topics no longer exist in that mode.
+     *
+     * Nothing pushes the answer, so it is polled - slowly, because it changes
+     * once per connect.
+     */
+    async _syncCaps() {
+      if (!this._hass || typeof this._hass.callWS !== "function") return;
+      if (this._capsBusy) return;
+      const now = Date.now();
+      if (this._capsAt && now - this._capsAt < CAPS_POLL_MS) return;
+      this._capsAt = now;
+      this._capsBusy = true;
+      try {
+        const out = await this._hass.callWS({
+          type: "hoymiles/device/info",
+          dev_id: this._dev(),
+        });
+        if (!this.isConnected) return;
+        const keys = Array.isArray(out && out.caps) ? out.caps : null;
+        /* `caps_ready` is the unit having described itself at least once. Before
+           that the list means "not known", never "nothing there" - and an empty
+           list *after* that is the real state the page has to show: the unit
+           announced a new profile and has not republished anything yet. */
+        const ready = !!out && out.known === true && out.caps_ready === true
+          && keys !== null;
+        const epoch = Number(out && out.caps_epoch) || 0;
+        this._caps = ready ? { epoch, keys: new Set(keys) } : null;
+        const sig = this._caps
+          ? epoch + ":" + Array.from(this._caps.keys).sort().join(",")
+          : "";
+        if (sig !== this._capsSig) {
+          this._capsSig = sig;
+          this.requestUpdate();
+        }
+      } catch (err) {
+        /* No answer: keep drawing everything. */
+      } finally {
+        this._capsBusy = false;
+      }
+    }
+
+    /** True when the unit announced a new profile and nothing came back yet. */
+    _capsBlank() {
+      return !!this._caps && this._caps.keys.size === 0;
+    }
+
     /** True when this device publishes any fan entity (protocol §35 - §38). */
     _hasFan() {
       return this._has("fan_mode", "select") || this._has("pcs_fan_speed");
@@ -4817,6 +5032,7 @@ function _hmControlRegister() {
      * leftover space is a good place to say why nothing is moving.
      */
     _fanCard() {
+      if (!this._capsOk("fan")) return "";
       if (!this._hasFan()) {
         // No fan on this model: no card at all, so the grid does not keep an
         // empty cell for a row that has nothing to show.
@@ -4909,10 +5125,11 @@ function _hmControlRegister() {
         });
       }
 
-      if (this._has("feed_power") && this._allowMasterOnly()) {
+      if (this._has("feed_power") && this._allowMaster()) {
         /* V0.6.7 §29: same shape as the house group - the enable switch decides
            whether the limit exists at all, so an off switch leaves one compact
-           row instead of a dead slider. */
+           row instead of a dead slider.  §29/§30 are 主机和单机, so a
+           stand-alone unit gets the group too (V0.6.6 had it as 仅主机). */
         groups.push({
           id: "feed", en: "Feed-in", zh: "馈网", rows: [this._feedRow()],
         });
@@ -4946,6 +5163,14 @@ function _hmControlRegister() {
       /* §21-§32: a slave publishes and accepts none of these, so the card would
          be a stack of dead sliders. */
       if (!this._allowMaster()) return "";
+      /* Every limit group is MQTT&MQTTS, so the unit republishes at least one
+         of them in either protocol.  None of them means the unit does not have
+         a ceiling at all - and then there is no card.  The rows inside follow
+         the old existence logic, so a group never loses half its fields. */
+      if (!this._capsOk(
+        "output_power", "input_power", "phase_output_power",
+        "phase_input_power", "phase_house_in_power", "feed_power",
+      )) return "";
 
       const groups = this._powerLimitGroups();
       if (!groups.length) return "";
@@ -5028,6 +5253,7 @@ function _hmControlRegister() {
      * invited a pack change that silently never happened.
      */
     _heatCard() {
+      if (!this._capsOk("heat")) return "";
       if (!this._has("heat_param")) return "";
       const mode = this._heatModeShown();
       const off = mode === HEAT_MODE_OFF;
@@ -5076,6 +5302,7 @@ function _hmControlRegister() {
      * sense.
      */
     _socCard() {
+      if (!this._capsOk("soc_h_limit", "soc_l_limit")) return "";
       if (!this._has("charge_soc_limit") && !this._has("discharge_soc_limit")) {
         return "";
       }
@@ -5187,7 +5414,7 @@ function _hmControlRegister() {
     /** iOS segmented control. `options` = [{id, label, enabled, title, pending}] */
     _segment(options, current, onPick, extraClass = "") {
       return html`
-        <div class="seg ${extraClass}">
+        <div class="seg ${extraClass}" data-n=${options.length}>
           ${options.map((opt) => html`
             <button class=${[
               opt.id === current ? "on" : "",
@@ -5419,7 +5646,10 @@ function _hmControlRegister() {
         bare: true,
         topic: this._topic("select/<dev_id>/ems_mode/command"),
         ctrl: this._segment(options, current, (id) => this._setEmsMode(id),
-          supported.length <= 2 ? "fluid" : "fluid ems5"),
+          /* Three or fewer fit one flex row at every width.  Four or more use
+             the count-keyed grid, so the buttons always fill the row instead
+             of leaving a track empty when a role drops one (see .seg.fluid.ems). */
+          supported.length <= 3 ? "fluid" : "fluid ems"),
       });
     }
 
@@ -6310,9 +6540,17 @@ function _hmControlRegister() {
           key: "eps_relay",
           subEn: "on = relay closed, port live",
           subZh: "开启 = 端口有输出",
+          /* Opening it costs a lock-out, so that direction is questioned; closing
+             it is the way back and stays one click. */
+          guard: () => this._confirmRelayOpen(),
           /* §41 wants the strings `close` / `open`, not a boolean. */
           write: (on) => this._writeFine(
             "eps_relay", on ? "close" : "open", "Off-grid relay", "离网继电器",
+            on ? "" : this._t(
+              "The relay is now locked - it will accept close again in about "
+              + "10 minutes at the earliest.",
+              "继电器已锁定，最早约 10 分钟后才会接受重新吸合。",
+            ),
           ),
         }));
       }
@@ -6329,7 +6567,7 @@ function _hmControlRegister() {
     }
 
     /** One tile of the §42 switch row: icon, name, rule and the switch. */
-    _fineSwitchTile({ icon, en, zh, key, subEn, subZh, write }) {
+    _fineSwitchTile({ icon, en, zh, key, subEn, subZh, write, guard }) {
       const state = this._state(key, "switch");
       const on = !!state && String(state.state) === "on";
       return html`
@@ -6338,8 +6576,59 @@ function _hmControlRegister() {
           <span class="ft">${this._t(en, zh)}</span>
           <span class="fss">${this._t(subEn, subZh)}</span>
           <ha-switch .checked=${on}
-            @change=${(e) => write(e.target.checked)}></ha-switch>
+            @change=${async (event) => {
+              /* The switch on screen already moved by the time this runs, so a
+                 declined question has to put the knob back by hand - otherwise
+                 the tile would claim a state the device never got. */
+              const knob = event.currentTarget;
+              const next = knob.checked === true;
+              if (guard && !next && on) {
+                const ok = await guard();
+                if (!ok) {
+                  knob.checked = on;
+                  return;
+                }
+              }
+              write(next);
+            }}></ha-switch>
         </div>`;
+    }
+
+    /**
+     * Ask before opening the off-grid relay (§42).
+     *
+     * The firmware locks the relay after it opens: it refuses `close` for a
+     * while, and every further open during the day adds another step to that
+     * wait. Nothing in `fine_ctrl` reports the lock or how long is left (the
+     * group describes `eps_relay` and nothing else), so the card cannot count
+     * down - it can only warn, which is exactly what the question is for.
+     * Worded as a rule rather than a number: a guessed "20 min" would be wrong
+     * the moment somebody opens the relay from the app instead.
+     */
+    async _confirmRelayOpen() {
+      const ok = await this._askConfirm({
+        title: this._t(
+          "Open the off-grid relay?", "断开离网继电器？",
+        ),
+        message: this._t(
+          "Once opened, the relay stays locked for a while before it accepts "
+          + "`close` again: about 10 minutes the first time, and 10 minutes "
+          + "longer each further time (20, 30…). The off-grid port has no "
+          + "output during that wait.",
+          "断开后，继电器会锁定一段时间才接受重新吸合：第一次约 10 分钟，"
+          + "之后每再断开一次就再加 10 分钟（20 分钟、30 分钟…）。"
+          + "锁定期间离网端口没有输出。",
+        ),
+        confirmText: this._t("Got it", "知道了"),
+        cancelText: this._t("Cancel", "取消"),
+      });
+      if (!ok) {
+        this._showToast(this._t(
+          "Cancelled - the relay stays closed.",
+          "已取消，继电器保持吸合。",
+        ));
+      }
+      return ok;
     }
 
     /** §11 / §12: the virtual meter power setpoint (object payload, one field). */
@@ -6391,7 +6680,20 @@ function _hmControlRegister() {
       const rx = (info && info.rx) || null;
       const raw = rx ? Number(rx.count) : 0;
       const count = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
-      if (!count) return html``;
+      /* Always visible in this mode, even at zero: an empty strip is the
+         difference between "nothing has been pushed yet" and "the card is
+         broken".  It used to be hidden until the first write, which read as a
+         missing feature on a unit whose pushes were arriving but whose firmware
+         kept reporting `general`. */
+      if (!count) {
+        return html`
+          <div class="meter-rx wait">
+            <span class="rx-count">${this._t("External pushes", "外部推送")} 0</span>
+            <span class="rx-state">${this._t(
+              "waiting for the external meter", "等待外部电表推送",
+            )}</span>
+          </div>`;
+      }
       const fields = rx.fields || {};
       const bits = [];
       if (fields.power != null) bits.push(`${fields.power} W`);
@@ -6566,15 +6868,28 @@ function _hmControlRegister() {
               + "eng_out / eng_in 是虚拟电表上报的累计读数。每次通过校验的更新都会立即"
               + "下发给设备并持续重发，因此外部电表不必自己顶着 1 分钟的租约。",
             )}</div>
+            <div class="vm-sub">${this._t(
+              "Send the key in an X-Hoymiles-Key header (or as ?key=). Tap the "
+              + "key or the curl line to select all of it.",
+              "密钥放在 X-Hoymiles-Key 请求头里（也可以写成 ?key=）。"
+              + "点一下密钥或命令行会全选，方便手动复制。",
+            )}</div>
             <code class="vm-url">POST ${info.url}</code>
             <div class="vm-row">
-              <code class="vm-key">${info.header}: ${info.key}</code>
-              <button class="btn small" @click=${() => this._copyVm()}>${this._t("Copy", "复制")}</button>
+              <code class="vm-key" title=${this._t("Click to select all", "点击全选")}
+                @click=${this._selectAll}>${info.header}: ${info.key}</code>
+              <button class="btn small"
+                @click=${() => this._copyKey()}>${this._t("Copy key", "复制密钥")}</button>
               <button class="btn small danger"
                 @click=${() => this._rotateVm()}>${this._t("New key", "换新密钥")}</button>
             </div>
             <div class="vm-range">${range}</div>
-            <pre>${info.example_curl}</pre>
+            <div class="vm-row">
+              <span class="vm-sub" style="margin:0">${this._t("curl", "命令行示例")}</span>
+              <button class="btn small"
+                @click=${() => this._copyCurl()}>${this._t("Copy curl", "复制 curl")}</button>
+            </div>
+            <pre @click=${this._selectAll}>${info.example_curl}</pre>
           </div>
         </details>`;
     }
@@ -6611,18 +6926,85 @@ function _hmControlRegister() {
       if (this.isConnected) this.requestUpdate();
     }
 
-    async _copyVm() {
+    /**
+     * Copy text, falling back to the old `execCommand` path.
+     *
+     * `navigator.clipboard` **does not exist** unless the page is a secure
+     * context, and this integration is normally opened over plain HTTP on the
+     * LAN (`http://192.168.31.99:8123`), so the modern API throws instead of
+     * copying.  The hidden-textarea fallback is therefore the path that
+     * actually runs; it is deprecated but every current browser still supports
+     * it outside a secure context.
+     *
+     * Returns whether anything was actually copied, so the caller can show the
+     * value instead of lying with a "copied" toast.
+     */
+    async _copyText(text, okMessage) {
+      if (!text) return false;
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          await navigator.clipboard.writeText(text);
+          this._showToast(okMessage);
+          return true;
+        } catch (err) {
+          /* Denied permission (or no user gesture): fall through. */
+        }
+      }
+      try {
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "");
+        area.style.cssText = "position:fixed;top:-1000px;left:-1000px;opacity:0;";
+        document.body.appendChild(area);
+        area.select();
+        area.setSelectionRange(0, text.length);
+        const done = document.execCommand("copy");
+        document.body.removeChild(area);
+        if (done) {
+          this._showToast(okMessage);
+          return true;
+        }
+      } catch (err) {
+        /* Nothing else to try. */
+      }
+      return false;
+    }
+
+    /** Select the whole text of the element that was clicked. */
+    _selectAll(event) {
+      const node = event && event.currentTarget;
+      if (!node) return;
+      try {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } catch (err) {
+        /* Selection is a convenience; never break the card over it. */
+      }
+    }
+
+    async _copyKey() {
       const info = this._vmInfo;
       if (!info) return;
-      try {
-        await navigator.clipboard.writeText(info.example_curl);
-        this._showToast(this._t("curl command copied.", "已复制 curl 命令。"));
-      } catch (err) {
-        /* Clipboard access needs a secure context (HTTPS or localhost). Plain
-           HTTP on the LAN refuses, so fall back to showing the text rather than
-           pretending the copy worked. */
-        this._showToast(info.example_curl, true);
-      }
+      const done = await this._copyText(
+        info.key,
+        this._t("Key copied.", "已复制密钥。"),
+      );
+      /* No clipboard at all: show the key on its own so it can be typed or
+         selected by hand, instead of a toast that claims it worked. */
+      if (!done) this._showToast(info.key, true);
+    }
+
+    async _copyCurl() {
+      const info = this._vmInfo;
+      if (!info) return;
+      const done = await this._copyText(
+        info.example_curl,
+        this._t("curl command copied.", "已复制 curl 命令。"),
+      );
+      if (!done) this._showToast(info.example_curl, true);
     }
 
     async _rotateVm() {
@@ -6764,7 +7146,7 @@ function _hmControlRegister() {
      * where the click was made, not in a toast that disappears before the
      * device has even acknowledged the command.
      */
-    _writeFine(field, value, en, zh) {
+    _writeFine(field, value, en, zh, note) {
       const label = this._t(en, zh);
       const on = value === true || value === "close";
       const show = this._t(on ? "on" : "off", on ? "开启" : "关闭");
@@ -6778,10 +7160,12 @@ function _hmControlRegister() {
              by the next tick - the forbid flag would silently switch itself off. */
           await this._sendFineField(field, value, label, { silent: true });
           this._busySet(0, "done");
-          this._busyDone(this._t(
-            `${label}: ${show} sent. The switch follows what the device reports.`,
-            `${label}：已下发 ${show}。开关状态以设备回报为准。`,
-          ));
+          this._busyDone(
+            this._t(
+              `${label}: ${show} sent. The switch follows what the device reports.`,
+              `${label}：已下发 ${show}。开关状态以设备回报为准。`,
+            ) + (note ? " " + note : ""),
+          );
         },
       });
     }
